@@ -52,12 +52,9 @@ import { useCommandDialog } from "@tui/component/dialog-command"
 import type { DialogContext } from "@tui/ui/dialog"
 import { useKeybind } from "@tui/context/keybind"
 import { Header } from "./header"
-import { parsePatch } from "diff"
 import { useDialog } from "../../ui/dialog"
 import { TodoItem } from "../../component/todo-item"
 import { DialogMessage } from "./dialog-message"
-import type { PromptInfo } from "../../component/prompt/history"
-import { DialogConfirm } from "@tui/ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
@@ -68,7 +65,6 @@ import parsers from "../../../../../../parsers-config.ts"
 import { Clipboard } from "../../util/clipboard"
 import { Toast, useToast } from "../../ui/toast"
 import { useKV } from "../../context/kv.tsx"
-import { Editor } from "../../util/editor"
 import stripAnsi from "strip-ansi"
 import { Footer } from "./footer.tsx"
 import { usePromptRef } from "../../context/prompt"
@@ -77,10 +73,18 @@ import { Filesystem } from "@/util/filesystem"
 import { Global } from "@/global"
 import { PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
-import { DialogExportOptions } from "../../ui/dialog-export-options"
-import { formatTranscript } from "../../util/transcript"
 import { UI } from "@/cli/ui.ts"
 import { useTuiConfig } from "../../context/tui-config"
+import {
+  buildPrompt,
+  confirmRedo,
+  copyTranscript,
+  exportTranscript,
+  findLastAssistantText,
+  findLastUserMessage,
+  findNextVisibleMessage,
+  parseRevert,
+} from "./actions"
 
 addDefaultParsers(parsers.parsers)
 
@@ -260,40 +264,14 @@ export function Session() {
     }
   })
 
-  // Helper: Find next visible message boundary in direction
-  const findNextVisibleMessage = (direction: "next" | "prev"): string | null => {
-    const children = scroll.getChildren()
-    const messagesList = messages()
-    const scrollTop = scroll.y
-
-    // Get visible messages sorted by position, filtering for valid non-synthetic, non-ignored content
-    const visibleMessages = children
-      .filter((c) => {
-        if (!c.id) return false
-        const message = messagesList.find((m) => m.id === c.id)
-        if (!message) return false
-
-        // Check if message has valid non-synthetic, non-ignored text parts
-        const parts = sync.data.part[message.id]
-        if (!parts || !Array.isArray(parts)) return false
-
-        return parts.some((part) => part && part.type === "text" && !part.synthetic && !part.ignored)
-      })
-      .sort((a, b) => a.y - b.y)
-
-    if (visibleMessages.length === 0) return null
-
-    if (direction === "next") {
-      // Find first message below current position
-      return visibleMessages.find((c) => c.y > scrollTop + 10)?.id ?? null
-    }
-    // Find last message above current position
-    return [...visibleMessages].reverse().find((c) => c.y < scrollTop - 10)?.id ?? null
-  }
-
-  // Helper: Scroll to message in direction or fallback to page scroll
   const scrollToMessage = (direction: "next" | "prev", dialog: ReturnType<typeof useDialog>) => {
-    const targetID = findNextVisibleMessage(direction)
+    const targetID = findNextVisibleMessage(
+      scroll.getChildren(),
+      messages(),
+      sync.data.part,
+      scroll.y,
+      direction,
+    )
 
     if (!targetID) {
       scroll.scrollBy(direction === "next" ? scroll.height : -scroll.height)
@@ -448,8 +426,8 @@ export function Session() {
         aliases: ["summarize"],
       },
       onSelect: (dialog) => {
-        const selectedModel = local.model.current()
-        if (!selectedModel) {
+        const model = local.model.current()
+        if (!model) {
           toast.show({
             variant: "warning",
             message: "Connect a provider to summarize this session",
@@ -459,8 +437,8 @@ export function Session() {
         }
         sdk.client.session.summarize({
           sessionID: route.sessionID,
-          modelID: selectedModel.modelID,
-          providerID: selectedModel.providerID,
+          modelID: model.modelID,
+          providerID: model.providerID,
         })
         dialog.clear()
       },
@@ -496,7 +474,11 @@ export function Session() {
         const status = sync.data.session_status?.[route.sessionID]
         if (status?.type !== "idle") await sdk.client.session.abort({ sessionID: route.sessionID }).catch(() => {})
         const revert = session()?.revert?.messageID
-        const message = messages().findLast((x) => (!revert || x.id < revert) && x.role === "user")
+        const message = findLastUserMessage(
+          messages().filter((x): x is UserMessage => x.role === "user"),
+          sync.data.part,
+          revert,
+        )
         if (!message) return
         sdk.client.session
           .revert({
@@ -506,19 +488,7 @@ export function Session() {
           .then(() => {
             toBottom()
           })
-        const parts = sync.data.part[message.id]
-        prompt.set(
-          parts.reduce(
-            (agg, part) => {
-              if (part.type === "text") {
-                if (!part.synthetic) agg.input += part.text
-              }
-              if (part.type === "file") agg.parts.push(part)
-              return agg
-            },
-            { input: "", parts: [] as PromptInfo["parts"] },
-          ),
-        )
+        prompt.set(buildPrompt(sync.data.part[message.id] ?? []))
         dialog.clear()
       },
     },
@@ -780,33 +750,13 @@ export function Session() {
       keybind: "messages_copy",
       category: "Session",
       onSelect: (dialog) => {
-        const revertID = session()?.revert?.messageID
-        const lastAssistantMessage = messages().findLast(
-          (msg) => msg.role === "assistant" && (!revertID || msg.id < revertID),
+        const text = findLastAssistantText(
+          messages().filter((msg): msg is AssistantMessage => msg.role === "assistant"),
+          sync.data.part,
+          session()?.revert?.messageID,
         )
-        if (!lastAssistantMessage) {
-          toast.show({ message: "No assistant messages found", variant: "error" })
-          dialog.clear()
-          return
-        }
-
-        const parts = sync.data.part[lastAssistantMessage.id] ?? []
-        const textParts = parts.filter((part) => part.type === "text")
-        if (textParts.length === 0) {
-          toast.show({ message: "No text parts found in last assistant message", variant: "error" })
-          dialog.clear()
-          return
-        }
-
-        const text = textParts
-          .map((part) => part.text)
-          .join("\n")
-          .trim()
         if (!text) {
-          toast.show({
-            message: "No text content found in last assistant message",
-            variant: "error",
-          })
+          toast.show({ message: "No assistant messages found", variant: "error" })
           dialog.clear()
           return
         }
@@ -826,21 +776,18 @@ export function Session() {
       },
       onSelect: async (dialog) => {
         try {
-          const sessionData = session()
-          if (!sessionData) return
-          const sessionMessages = messages()
-          const transcript = formatTranscript(
-            sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
-            {
-              thinking: showThinking(),
-              toolDetails: showDetails(),
-              assistantMetadata: showAssistantMetadata(),
-            },
-          )
-          await Clipboard.copy(transcript)
+          const info = session()
+          if (!info) return
+          await copyTranscript({
+            session: info,
+            messages: messages(),
+            parts: sync.data.part,
+            thinking: showThinking(),
+            toolDetails: showDetails(),
+            assistantMetadata: showAssistantMetadata(),
+          })
           toast.show({ message: "Session transcript copied to clipboard!", variant: "success" })
-        } catch (error) {
+        } catch {
           toast.show({ message: "Failed to copy session transcript", variant: "error" })
         }
         dialog.clear()
@@ -856,52 +803,20 @@ export function Session() {
       },
       onSelect: async (dialog) => {
         try {
-          const sessionData = session()
-          if (!sessionData) return
-          const sessionMessages = messages()
-
-          const defaultFilename = `session-${sessionData.id.slice(0, 8)}.md`
-
-          const options = await DialogExportOptions.show(
+          const info = session()
+          if (!info) return
+          const name = await exportTranscript({
             dialog,
-            defaultFilename,
-            showThinking(),
-            showDetails(),
-            showAssistantMetadata(),
-            false,
-          )
-
-          if (options === null) return
-
-          const transcript = formatTranscript(
-            sessionData,
-            sessionMessages.map((msg) => ({ info: msg, parts: sync.data.part[msg.id] ?? [] })),
-            {
-              thinking: options.thinking,
-              toolDetails: options.toolDetails,
-              assistantMetadata: options.assistantMetadata,
-            },
-          )
-
-          if (options.openWithoutSaving) {
-            // Just open in editor without saving
-            await Editor.open({ value: transcript, renderer })
-          } else {
-            const exportDir = process.cwd()
-            const filename = options.filename.trim()
-            const filepath = path.join(exportDir, filename)
-
-            await Bun.write(filepath, transcript)
-
-            // Open with EDITOR if available
-            const result = await Editor.open({ value: transcript, renderer })
-            if (result !== undefined) {
-              await Bun.write(filepath, result)
-            }
-
-            toast.show({ message: `Session exported to ${filename}`, variant: "success" })
-          }
-        } catch (error) {
+            session: info,
+            messages: messages(),
+            parts: sync.data.part,
+            thinking: showThinking(),
+            toolDetails: showDetails(),
+            assistantMetadata: showAssistantMetadata(),
+            renderer,
+          })
+          if (name) toast.show({ message: `Session exported to ${name}`, variant: "success" })
+        } catch {
           toast.show({ message: "Failed to export session", variant: "error" })
         }
         dialog.clear()
@@ -965,31 +880,7 @@ export function Session() {
   const revertInfo = createMemo(() => session()?.revert)
   const revertMessageID = createMemo(() => revertInfo()?.messageID)
 
-  const revertDiffFiles = createMemo(() => {
-    const diffText = revertInfo()?.diff ?? ""
-    if (!diffText) return []
-
-    try {
-      const patches = parsePatch(diffText)
-      return patches.map((patch) => {
-        const filename = patch.newFileName || patch.oldFileName || "unknown"
-        const cleanFilename = filename.replace(/^[ab]\//, "")
-        return {
-          filename: cleanFilename,
-          additions: patch.hunks.reduce(
-            (sum, hunk) => sum + hunk.lines.filter((line) => line.startsWith("+")).length,
-            0,
-          ),
-          deletions: patch.hunks.reduce(
-            (sum, hunk) => sum + hunk.lines.filter((line) => line.startsWith("-")).length,
-            0,
-          ),
-        }
-      })
-    } catch (error) {
-      return []
-    }
-  })
+  const revertDiffFiles = createMemo(() => parseRevert(revertInfo()?.diff))
 
   const revertRevertedMessages = createMemo(() => {
     const messageID = revertMessageID()
@@ -1063,14 +954,7 @@ export function Session() {
                         const dialog = useDialog()
 
                         const handleUnrevert = async () => {
-                          const confirmed = await DialogConfirm.show(
-                            dialog,
-                            "Confirm Redo",
-                            "Are you sure you want to restore the reverted messages?",
-                          )
-                          if (confirmed) {
-                            command.trigger("session.redo")
-                          }
+                          if (await confirmRedo(dialog)) command.trigger("session.redo")
                         }
 
                         return (
@@ -2242,8 +2126,6 @@ function normalizePath(input?: string) {
 
   if (!relative) return "."
   if (!relative.startsWith("..")) return relative
-
-  // outside cwd - use absolute
   return absolute
 }
 
