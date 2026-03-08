@@ -62,10 +62,10 @@ import {
   effectiveWorkspaceOrder,
   errorMessage,
   getDraggableId,
-  latestRootSession,
   sortedRootSessions,
   workspaceKey,
 } from "./layout/helpers"
+import { createLayoutNavigation } from "./layout/navigation"
 import {
   collectNewSessionDeepLinks,
   collectOpenProjectDeepLinks,
@@ -293,11 +293,28 @@ export default function Layout(props: ParentProps) {
     setHoverProject(undefined)
   }
 
-  const navigateWithSidebarReset = (href: string) => {
-    clearSidebarHoverState()
-    navigate(href)
-    layout.mobileSidebar.hide()
-  }
+  const nav = createLayoutNavigation({
+    layout,
+    store,
+    params,
+    currentDir,
+    currentProject,
+    server,
+    globalSync,
+    globalSDK,
+    clearSidebarHoverState,
+    setLastProjectSession: (root, session) => setStore("lastProjectSession", root, session),
+    clearLastProjectSession: (root) =>
+      setStore(
+        "lastProjectSession",
+        produce((draft) => {
+          delete draft[root]
+        }),
+      ),
+    navigate,
+    hideMobileSidebar: () => layout.mobileSidebar.hide(),
+  })
+  const navigateWithSidebarReset = nav.navigateWithSidebarReset
 
   function cycleTheme(direction = 1) {
     const ids = availableThemeEntries().map(([id]) => id)
@@ -900,7 +917,7 @@ export default function Layout(props: ParentProps) {
         if (next) prefetchSession(next)
       }
 
-      navigateToSession(session)
+      nav.navigateToSession(session)
       return
     }
   }
@@ -1114,53 +1131,8 @@ export default function Layout(props: ParentProps) {
     dialog.show(() => <DialogSettings />)
   }
 
-  function projectRoot(directory: string) {
-    const project = layout.projects
-      .list()
-      .find((item) => item.worktree === directory || item.sandboxes?.includes(directory))
-    if (project) return project.worktree
-
-    const known = Object.entries(store.workspaceOrder).find(
-      ([root, dirs]) => root === directory || dirs.includes(directory),
-    )
-    if (known) return known[0]
-
-    const [child] = globalSync.child(directory, { bootstrap: false })
-    const id = child.project
-    if (!id) return directory
-
-    const meta = globalSync.data.project.find((item) => item.id === id)
-    return meta?.worktree ?? directory
-  }
-
-  function activeProjectRoot(directory: string) {
-    return currentProject()?.worktree ?? projectRoot(directory)
-  }
-
-  function touchProjectRoute() {
-    const root = currentProject()?.worktree
-    if (!root) return
-    if (server.projects.last() !== root) server.projects.touch(root)
-    return root
-  }
-
-  function rememberSessionRoute(directory: string, id: string, root = activeProjectRoot(directory)) {
-    setStore("lastProjectSession", root, { directory, id, at: Date.now() })
-    return root
-  }
-
-  function clearLastProjectSession(root: string) {
-    if (!store.lastProjectSession[root]) return
-    setStore(
-      "lastProjectSession",
-      produce((draft) => {
-        delete draft[root]
-      }),
-    )
-  }
-
-  function syncSessionRoute(directory: string, id: string, root = activeProjectRoot(directory)) {
-    rememberSessionRoute(directory, id, root)
+  function syncSessionRoute(directory: string, id: string, root = nav.activeProjectRoot(directory)) {
+    nav.rememberSessionRoute(directory, id, root)
     notification.session.markViewed(id)
     const expanded = untrack(() => store.workspaceExpanded[directory])
     if (expanded === false) {
@@ -1170,100 +1142,16 @@ export default function Layout(props: ParentProps) {
     return root
   }
 
-  async function navigateToProject(directory: string | undefined) {
-    if (!directory) return
-    const root = projectRoot(directory)
-    server.projects.touch(root)
-    const project = layout.projects.list().find((item) => item.worktree === root)
-    let dirs = project
-      ? effectiveWorkspaceOrder(root, [root, ...(project.sandboxes ?? [])], store.workspaceOrder[root])
-      : [root]
-    const canOpen = (value: string | undefined) => {
-      if (!value) return false
-      return dirs.some((item) => workspaceKey(item) === workspaceKey(value))
-    }
-    const refreshDirs = async (target?: string) => {
-      if (!target || target === root || canOpen(target)) return canOpen(target)
-      const listed = await globalSDK.client.worktree
-        .list({ directory: root })
-        .then((x) => x.data ?? [])
-        .catch(() => [] as string[])
-      dirs = effectiveWorkspaceOrder(root, [root, ...listed], store.workspaceOrder[root])
-      return canOpen(target)
-    }
-    const openSession = async (target: { directory: string; id: string }) => {
-      if (!canOpen(target.directory)) return false
-      const [data] = globalSync.child(target.directory, { bootstrap: false })
-      if (data.session.some((item) => item.id === target.id)) {
-        setStore("lastProjectSession", root, { directory: target.directory, id: target.id, at: Date.now() })
-        navigateWithSidebarReset(`/${base64Encode(target.directory)}/session/${target.id}`)
-        return true
-      }
-      const resolved = await globalSDK.client.session
-        .get({ sessionID: target.id })
-        .then((x) => x.data)
-        .catch(() => undefined)
-      if (!resolved?.directory) return false
-      if (!canOpen(resolved.directory)) return false
-      setStore("lastProjectSession", root, { directory: resolved.directory, id: resolved.id, at: Date.now() })
-      navigateWithSidebarReset(`/${base64Encode(resolved.directory)}/session/${resolved.id}`)
-      return true
-    }
-
-    const projectSession = store.lastProjectSession[root]
-    if (projectSession?.id) {
-      await refreshDirs(projectSession.directory)
-      const opened = await openSession(projectSession)
-      if (opened) return
-      clearLastProjectSession(root)
-    }
-
-    const latest = latestRootSession(
-      dirs.map((item) => globalSync.child(item, { bootstrap: false })[0]),
-      Date.now(),
-    )
-    if (latest && (await openSession(latest))) {
-      return
-    }
-
-    const fetched = latestRootSession(
-      await Promise.all(
-        dirs.map(async (item) => ({
-          path: { directory: item },
-          session: await globalSDK.client.session
-            .list({ directory: item })
-            .then((x) => x.data ?? [])
-            .catch(() => []),
-        })),
-      ),
-      Date.now(),
-    )
-    if (fetched && (await openSession(fetched))) {
-      return
-    }
-
-    navigateWithSidebarReset(`/${base64Encode(root)}/session`)
-  }
-
-  function navigateToSession(session: Session | undefined) {
-    if (!session) return
-    navigateWithSidebarReset(`/${base64Encode(session.directory)}/session/${session.id}`)
-  }
-
-  function openProject(directory: string, navigate = true) {
-    layout.projects.open(directory)
-    if (navigate) navigateToProject(directory)
-  }
 
   const handleDeepLinks = (urls: string[]) => {
     if (!server.isLocal()) return
 
     for (const directory of collectOpenProjectDeepLinks(urls)) {
-      openProject(directory)
+      nav.openProject(directory)
     }
 
     for (const link of collectNewSessionDeepLinks(urls)) {
-      openProject(link.directory, false)
+      nav.openProject(link.directory, false)
       const slug = base64Encode(link.directory)
       if (link.prompt) {
         setSessionHandoff(slug, { prompt: link.prompt })
@@ -1305,30 +1193,6 @@ export default function Layout(props: ParentProps) {
     setWorkspaceName(directory, next, projectId, branch)
   }
 
-  function closeProject(directory: string) {
-    const list = layout.projects.list()
-    const index = list.findIndex((x) => x.worktree === directory)
-    const active = currentProject()?.worktree === directory
-    if (index === -1) return
-    const next = list[index + 1]
-
-    if (!active) {
-      layout.projects.close(directory)
-      return
-    }
-
-    if (!next) {
-      layout.projects.close(directory)
-      navigate("/")
-      return
-    }
-
-    navigateWithSidebarReset(`/${base64Encode(next.worktree)}/session`)
-    layout.projects.close(directory)
-    queueMicrotask(() => {
-      void navigateToProject(next.worktree)
-    })
-  }
 
   function toggleProjectWorkspaces(project: LocalProject) {
     const enabled = layout.sidebar.workspaces(project.worktree)()
@@ -1346,11 +1210,11 @@ export default function Layout(props: ParentProps) {
     function resolve(result: string | string[] | null) {
       if (Array.isArray(result)) {
         for (const directory of result) {
-          openProject(directory, false)
+          nav.openProject(directory, false)
         }
-        navigateToProject(result[0])
+        void nav.navigateToProject(result[0])
       } else if (result) {
-        openProject(result)
+        nav.openProject(result)
       }
     }
 
@@ -1397,7 +1261,7 @@ export default function Layout(props: ParentProps) {
     if (!result) return
 
     if (workspaceKey(store.lastProjectSession[root]?.directory ?? "") === workspaceKey(directory)) {
-      clearLastProjectSession(root)
+      nav.clearLastProjectSession(root)
     }
 
     globalSync.set(
@@ -1674,7 +1538,7 @@ export default function Layout(props: ParentProps) {
         }
 
         if (root === activeRoute.sessionProject) return
-        activeRoute.sessionProject = rememberSessionRoute(directory, id, root)
+        activeRoute.sessionProject = nav.rememberSessionRoute(directory, id, root)
       },
     ),
   )
@@ -1868,9 +1732,9 @@ export default function Layout(props: ParentProps) {
     onProjectMouseEnter: (worktree, event) => aim.enter(worktree, event),
     onProjectMouseLeave: (worktree) => aim.leave(worktree),
     onProjectFocus: (worktree) => aim.activate(worktree),
-    navigateToProject,
+    navigateToProject: nav.navigateToProject,
     openSidebar: () => layout.sidebar.open(),
-    closeProject,
+    closeProject: nav.closeProject,
     showEditProjectDialog,
     toggleProjectWorkspaces,
     workspacesEnabled: (project) => project.vcs === "git" && layout.sidebar.workspaces(project.worktree)(),
@@ -2004,7 +1868,7 @@ export default function Layout(props: ParentProps) {
                         <DropdownMenu.Item
                           data-action="project-close-menu"
                           data-project={base64Encode(p().worktree)}
-                          onSelect={() => closeProject(p().worktree)}
+                          onSelect={() => nav.closeProject(p().worktree)}
                         >
                           <DropdownMenu.ItemLabel>{language.t("common.close")}</DropdownMenu.ItemLabel>
                         </DropdownMenu.Item>
