@@ -26,7 +26,6 @@ import type { CustomModelLoader } from "./loaders/types"
 export namespace Provider {
   const log = Log.create({ service: "provider" })
 
-
   function googleVertexVars(options: Record<string, any>) {
     const project =
       options["project"] ?? Env.get("GOOGLE_CLOUD_PROJECT") ?? Env.get("GCP_PROJECT") ?? Env.get("GCLOUD_PROJECT")
@@ -50,9 +49,6 @@ export namespace Provider {
       return val ?? match
     })
   }
-
-
-
 
   export const Model = z
     .object({

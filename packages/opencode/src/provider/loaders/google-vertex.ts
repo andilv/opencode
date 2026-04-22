@@ -7,7 +7,10 @@ const loader: Loader = {
   id: "google-vertex",
   async load(provider) {
     const project =
-      provider.options?.project ?? Env.get("GOOGLE_CLOUD_PROJECT") ?? Env.get("GCP_PROJECT") ?? Env.get("GCLOUD_PROJECT")
+      provider.options?.project ??
+      Env.get("GOOGLE_CLOUD_PROJECT") ??
+      Env.get("GCP_PROJECT") ??
+      Env.get("GCLOUD_PROJECT")
 
     const location =
       provider.options?.location ?? Env.get("GOOGLE_CLOUD_LOCATION") ?? Env.get("VERTEX_LOCATION") ?? "us-central1"
